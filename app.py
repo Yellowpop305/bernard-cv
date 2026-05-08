@@ -85,15 +85,28 @@ def trace_tube():
 
 def image_to_lines(width_cm: float, gray: np.ndarray, single_line: bool) -> tuple:
     """
-    Direct port of Yellowpop's image_to_lines() from neon/neon.py
+    Direct port of Yellowpop's image_to_lines() from neon/neon.py, with added
+    noise-reduction preprocessing for JPG-compressed / textured customer uploads.
+
     Returns (thin_image, width_px) — the thinned binary and content width in pixels.
     """
+    # NEW: Gaussian blur to smooth out JPG compression artifacts and texture noise
+    # before thresholding. Critical for customer-uploaded images that have grain,
+    # backgrounds, or compression fragmentation.
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
     # 1. OTSU threshold
     _ret, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # 2. Invert if more than half the pixels are white (background should be black, strokes white)
     if cv2.countNonZero(thr) / thr.size > 0.5:
         cv2.bitwise_not(thr, thr)
+
+    # NEW: Morphological closing to fill small gaps in strokes and remove tiny
+    # speckle noise (3x3 kernel, light cleanup)
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel(3))
+    # NEW: Opening to remove small isolated specks (anti-aliasing fragments)
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel(2))
 
     # 3. Get bounding box of content
     bounding_box = cv2.boundingRect(thr)
@@ -103,7 +116,6 @@ def image_to_lines(width_cm: float, gray: np.ndarray, single_line: bool) -> tupl
         return None, 0
 
     # 4. Resize so that 1 pixel = 0.12 cm at the given sign width
-    #    This matches Yellowpop's scale exactly (line 104 of neon.py)
     scale = width_cm / 0.12 / width_px
     gray = cv2.resize(gray, None, fx=scale, fy=scale)
 
@@ -112,13 +124,17 @@ def image_to_lines(width_cm: float, gray: np.ndarray, single_line: bool) -> tupl
     if cv2.countNonZero(thr) / thr.size > 0.5:
         cv2.bitwise_not(thr, thr)
 
+    # NEW: Apply morphological cleanup again at production scale
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel(3))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel(2))
+
     # 6. Edge detection for outlined designs (when single_line=False)
     edges = cv2.Canny(thr, 20, 30)
     dilate = cv2.dilate(edges, kernel(50))
     edges = cv2.bitwise_and(edges, dilate)
     edges = cv2.dilate(edges, kernel(5))
 
-    # 7. Zhang-Suen thinning (THE key step)
+    # 7. Zhang-Suen thinning
     source = thr if single_line else edges
     thin = cv2.ximgproc.thinning(source, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
 
@@ -192,7 +208,17 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None
     # 5. THE KEY CALCULATION (from neon.py line 348-350):
     #    Find contours of the thinned image, sum arc lengths divided by 2
     contours, _hierarchy = cv2.findContours(result, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
-    arc_length_px = sum(cv2.arcLength(c, True) for c in contours) / 2.0
+
+    # NEW: Filter out tiny contours (likely artifacts from JPG compression / texture).
+    # A real tube path will have a meaningful length relative to the sign size.
+    # Threshold: at least 0.5% of width_px (e.g., for a 400px wide sign, drop contours < 2px)
+    min_contour_length_px = max(0.005 * width_px, 3.0)
+    all_contours_count = len(contours)
+    significant_contours = [c for c in contours if cv2.arcLength(c, True) >= min_contour_length_px]
+
+    arc_length_px = sum(cv2.arcLength(c, True) for c in significant_contours) / 2.0
+    arc_length_px_unfiltered = sum(cv2.arcLength(c, True) for c in contours) / 2.0
+    contours_dropped = all_contours_count - len(significant_contours)
 
     # 6. Convert to meters (matches Yellowpop's exact formula)
     raw_tube_length_m = round(arc_length_px * sign_width_cm / width_px / 100, 2)
@@ -204,9 +230,20 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None
     h, w = result.shape
     nonzero = int(cv2.countNonZero(result))
 
+    # NEW: Confidence flag
+    # If a high fraction of contours had to be dropped as artifacts, signal low confidence
+    contours_dropped_ratio = contours_dropped / max(all_contours_count, 1)
+    if all_contours_count > 500 or contours_dropped_ratio > 0.5:
+        confidence = 'low'
+    elif all_contours_count > 200 or contours_dropped_ratio > 0.25:
+        confidence = 'medium'
+    else:
+        confidence = 'high'
+
     return {
         'tube_length_m': tube_length_m,
         'tube_length_m_raw': raw_tube_length_m,
+        'tube_length_m_unfiltered': round(arc_length_px_unfiltered * sign_width_cm / width_px / 100, 2),
         'calibration_applied': calibration,
         'arc_length_px': round(arc_length_px, 1),
         'width_px': int(width_px),
@@ -216,7 +253,11 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None
         'filled_ratio': round(filled_ratio, 3) if filled_ratio is not None else None,
         'thin_image_dimensions': {'width': int(w), 'height': int(h)},
         'thin_nonzero_pixels': nonzero,
-        'contour_count': len(contours),
+        'contour_count_total': all_contours_count,
+        'contour_count_significant': len(significant_contours),
+        'contours_dropped_as_artifacts': contours_dropped,
+        'min_contour_length_px': round(min_contour_length_px, 1),
+        'confidence': confidence,
         'algorithm': 'yellowpop_production_zhang_suen_arclength',
     }
 
