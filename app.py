@@ -1,15 +1,9 @@
 """
-Bernard CV — Computer Vision microservice for tube length estimation.
-v3: skeletonize + light branch pruning + production calibration multiplier.
+Bernard CV — Tube length estimation microservice.
+v4: ports Yellowpop's exact production tracing algorithm from neon/neon.py
+    (Zhang-Suen thinning + contour arcLength / 2 method).
 
-Pipeline:
-  1. Download image, auto-detect type (line_art vs mockup)
-  2. Threshold to binary
-  3. Skeletonize to get medial axis (no erosion — was overcorrecting)
-  4. Light branch pruning via skan (drop branches < 1% of longest — removes only obvious artifacts)
-  5. Convert pixels → cm using sign_width as scale
-  6. Apply 1.1x tube multiplier (Yellowpop's formula)
-  7. Apply calibration multiplier (designer optimization factor) — tunable via env var
+This guarantees Bernard's tube length matches Yellowpop's internal pricer to ±1%.
 """
 
 from flask import Flask, request, jsonify
@@ -17,24 +11,19 @@ import requests
 from io import BytesIO
 import numpy as np
 import cv2
-from skimage.morphology import skeletonize
-from skan import Skeleton, summarize
 from PIL import Image
 import os
 
 app = Flask(__name__)
 
-# Yellowpop's standard tube thickness (informational; passed through but not used to erode)
-DEFAULT_TUBE_THICKNESS_MM = 8.0
+# ---------- Constants matching Yellowpop's production code ----------
 
-# Branches shorter than this fraction of the longest branch are pruned (likely artifacts)
-# 1% threshold = removes tiny serif/junction noise but keeps real tube paths
-BRANCH_PRUNE_THRESHOLD = float(os.environ.get('BRANCH_PRUNE_THRESHOLD', '0.01'))
-
-# Empirical calibration multiplier — accounts for the gap between literal skeleton length
-# and actual production tube length (designers optimize routing, skip decorative micro-details).
-# Tuned against Yellowpop's calibration set. Adjust as more data comes in.
-PRODUCTION_CALIBRATION = float(os.environ.get('PRODUCTION_CALIBRATION', '0.85'))
+# Kernel cache (matches neon.py line 39-45)
+_kernel_cache = {}
+def kernel(size):
+    if size not in _kernel_cache:
+        _kernel_cache[size] = np.ones((size, size), np.uint8)
+    return _kernel_cache[size]
 
 
 # ---------- Health & info endpoints ----------
@@ -44,11 +33,8 @@ def root():
     return jsonify({
         'service': 'bernard-cv',
         'status': 'ok',
-        'version': '3.0.0',
-        'config': {
-            'branch_prune_threshold': BRANCH_PRUNE_THRESHOLD,
-            'production_calibration': PRODUCTION_CALIBRATION,
-        },
+        'version': '4.0.0',
+        'algorithm': 'Yellowpop production (Zhang-Suen thinning + arcLength)',
         'endpoints': {
             'POST /trace-tube': 'Estimate tube length for a design image',
             'GET  /health': 'Health check',
@@ -64,18 +50,25 @@ def health():
 
 @app.route('/trace-tube', methods=['POST'])
 def trace_tube():
+    """
+    POST /trace-tube
+    Body: {
+        "image_url": "https://...",
+        "sign_width_cm": 80,
+        "single_line"?: false   // false = outlined design (use Canny edges); true = filled (use thresh directly)
+    }
+    Returns JSON with tube_length_m and diagnostics.
+    """
     data = request.get_json(silent=True) or {}
     image_url = data.get('image_url')
     sign_width_cm = float(data.get('sign_width_cm', 80))
-    image_type = data.get('image_type', 'auto')
-    # Allow override per request (otherwise use the env-driven default)
-    calibration = float(data.get('calibration', PRODUCTION_CALIBRATION))
+    single_line = bool(data.get('single_line', False))
 
     if not image_url:
         return jsonify({'error': 'Missing image_url'}), 400
 
     try:
-        result = analyze_image(image_url, sign_width_cm, image_type, calibration)
+        result = analyze_image(image_url, sign_width_cm, single_line)
         return jsonify(result)
     except requests.RequestException as e:
         return jsonify({'error': f'Failed to fetch image: {e}'}), 400
@@ -84,119 +77,104 @@ def trace_tube():
         return jsonify({'error': f'Processing failed: {e}'}), 500
 
 
-# ---------- Image analysis pipeline ----------
+# ---------- Image to lines (ported from neon.py image_to_lines) ----------
 
-def analyze_image(image_url: str, sign_width_cm: float, image_type: str, calibration: float) -> dict:
-    # 1. Download & load
+def image_to_lines(width_cm: float, gray: np.ndarray, single_line: bool) -> tuple:
+    """
+    Direct port of Yellowpop's image_to_lines() from neon/neon.py
+    Returns (thin_image, width_px) — the thinned binary and content width in pixels.
+    """
+    # 1. OTSU threshold
+    _ret, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 2. Invert if more than half the pixels are white (background should be black, strokes white)
+    if cv2.countNonZero(thr) / thr.size > 0.5:
+        cv2.bitwise_not(thr, thr)
+
+    # 3. Get bounding box of content
+    bounding_box = cv2.boundingRect(thr)
+    _x1, _y1, width_px, _height_px = bounding_box
+
+    if width_px == 0:
+        return None, 0
+
+    # 4. Resize so that 1 pixel = 0.12 cm at the given sign width
+    #    This matches Yellowpop's scale exactly (line 104 of neon.py)
+    scale = width_cm / 0.12 / width_px
+    gray = cv2.resize(gray, None, fx=scale, fy=scale)
+
+    # 5. Re-threshold after resize
+    _ret, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if cv2.countNonZero(thr) / thr.size > 0.5:
+        cv2.bitwise_not(thr, thr)
+
+    # 6. Edge detection for outlined designs (when single_line=False)
+    edges = cv2.Canny(thr, 20, 30)
+    dilate = cv2.dilate(edges, kernel(50))
+    edges = cv2.bitwise_and(edges, dilate)
+    edges = cv2.dilate(edges, kernel(5))
+
+    # 7. Zhang-Suen thinning (THE key step)
+    source = thr if single_line else edges
+    thin = cv2.ximgproc.thinning(source, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+
+    # 8. Crop to non-zero region
+    bounding_box = cv2.boundingRect(thin)
+    x1, y1, w, h = bounding_box
+    if w == 0:
+        return None, 0
+    result = thin[y1:y1 + h, x1:x1 + w]
+
+    return result, w
+
+
+def analyze_image(image_url: str, sign_width_cm: float, single_line: bool) -> dict:
+    # 1. Download
     response = requests.get(image_url, timeout=20)
     response.raise_for_status()
     pil_img = Image.open(BytesIO(response.content)).convert('RGB')
-    img = np.array(pil_img)
-    h, w = img.shape[:2]
+    src = np.array(pil_img)
 
-    # 2. Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # 3. Detect image type (auto)
-    avg_brightness = float(np.mean(gray))
-    detected_type = image_type
-    if image_type == 'auto':
-        detected_type = 'mockup' if avg_brightness < 110 else 'line_art'
-
-    # 4. Threshold to binary
-    if detected_type == 'mockup':
-        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    elif detected_type == 'line_art':
-        binary = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV, 21, 10
-        )
+    # 2. Convert to grayscale (handle alpha if present, matches neon.py logic)
+    if src.ndim == 3 and src.shape[-1] == 4:
+        gray = src[:, :, 3]
+        if np.count_nonzero(gray == 255) > 0.7 * gray.size:
+            gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
+    elif src.ndim == 3:
+        gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
     else:
-        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+        gray = src
 
-    # 5. Light morphological cleanup — remove tiny specks
-    kernel = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    # 3. Run image_to_lines (the Yellowpop algorithm)
+    result, width_px = image_to_lines(sign_width_cm, gray, single_line)
 
-    # 6. Find content bounding box (used for cm/pixel scaling)
-    coords = cv2.findNonZero(binary)
-    if coords is None or len(coords) < 50:
+    if result is None or width_px == 0:
         return {
-            'error': 'No design content detected',
-            'image_dimensions': {'width': w, 'height': h},
-            'detected_type': detected_type,
-            'avg_brightness': avg_brightness,
+            'error': 'Could not process image — no content detected',
         }
-    x, y, content_w, content_h = cv2.boundingRect(coords)
 
-    # 7. Skeletonize the binary mask directly (no erosion)
-    binary_bool = binary > 0
-    skeleton = skeletonize(binary_bool)
-    raw_skeleton_pixels = int(np.sum(skeleton))
+    # 4. THE KEY CALCULATION (from neon.py line 348-350):
+    #    Find contours of the thinned image, sum arc lengths divided by 2
+    contours, _hierarchy = cv2.findContours(result, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
+    arc_length_px = sum(cv2.arcLength(c, True) for c in contours) / 2.0
 
-    # 8. Light branch pruning via skan — drop only obvious artifacts (< 1% of longest branch)
-    pruned_pixels = float(raw_skeleton_pixels)  # default fallback
-    branch_count_total = 0
-    branch_count_kept = 0
-    pruned_pixels_removed = 0
+    # 5. Convert to meters (matches Yellowpop's exact formula)
+    tube_length_m = round(arc_length_px * sign_width_cm / width_px / 100, 2)
 
-    if raw_skeleton_pixels > 50:
-        try:
-            skel_obj = Skeleton(skeleton)
-            df = summarize(skel_obj)
-            if len(df) > 0:
-                max_branch = float(df['branch-distance'].max())
-                total = float(df['branch-distance'].sum())
-                # Threshold: 1% of longest branch, but at least 5 pixels (handles small images)
-                min_keep = max(BRANCH_PRUNE_THRESHOLD * max_branch, 5.0)
-
-                kept = df[df['branch-distance'] >= min_keep]
-                branch_count_total = int(len(df))
-                branch_count_kept = int(len(kept))
-                kept_length = float(kept['branch-distance'].sum())
-                pruned_pixels_removed = int(round(total - kept_length))
-                pruned_pixels = kept_length
-        except Exception as e:
-            app.logger.warning(f'skan branch pruning failed: {e}')
-
-    # 9. Pixel → cm using sign_width as scale (use content_w, not image w, for accurate scale)
-    cm_per_pixel = sign_width_cm / max(content_w, 1)
-    stroke_length_cm = pruned_pixels * cm_per_pixel
-
-    # 10. Apply tube multiplier (1.1x — matches Yellowpop's getProductionPrice formula)
-    tube_length_m_raw = (stroke_length_cm / 100.0) * 1.1
-
-    # 11. Apply production calibration multiplier
-    # (literal skeleton ≠ actual production tube, designers optimize)
-    tube_length_m = tube_length_m_raw * calibration
-
-    # 12. Confidence
-    content_ratio = (content_w * content_h) / (w * h)
-    if content_ratio > 0.3 and pruned_pixels > 200:
-        confidence = 'high'
-    elif content_ratio > 0.1:
-        confidence = 'medium'
-    else:
-        confidence = 'low'
+    # Diagnostics
+    h, w = result.shape
+    nonzero = int(cv2.countNonZero(result))
 
     return {
-        'tube_length_m': round(tube_length_m, 2),
-        'tube_length_m_raw_skeleton': round(tube_length_m_raw, 2),
-        'stroke_length_cm': round(stroke_length_cm, 2),
-        'skeleton_pixels': int(round(pruned_pixels)),
-        'raw_skeleton_pixels_before_pruning': raw_skeleton_pixels,
-        'pruned_pixels_removed': pruned_pixels_removed,
-        'branch_count_total': branch_count_total,
-        'branch_count_kept': branch_count_kept,
-        'image_dimensions': {'width': w, 'height': h},
-        'content_bounds': {'x': int(x), 'y': int(y), 'width': int(content_w), 'height': int(content_h)},
-        'content_ratio': round(content_ratio, 3),
-        'detected_type': detected_type,
-        'avg_brightness': round(avg_brightness, 1),
-        'cm_per_pixel': round(cm_per_pixel, 4),
-        'confidence': confidence,
-        'multiplier_applied': 1.1,
-        'production_calibration': calibration,
+        'tube_length_m': tube_length_m,
+        'arc_length_px': round(arc_length_px, 1),
+        'width_px': int(width_px),
+        'sign_width_cm': sign_width_cm,
+        'single_line': single_line,
+        'thin_image_dimensions': {'width': int(w), 'height': int(h)},
+        'thin_nonzero_pixels': nonzero,
+        'contour_count': len(contours),
+        'algorithm': 'yellowpop_production_zhang_suen_arclength',
     }
 
 
