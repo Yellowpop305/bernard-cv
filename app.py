@@ -62,13 +62,17 @@ def trace_tube():
     data = request.get_json(silent=True) or {}
     image_url = data.get('image_url')
     sign_width_cm = float(data.get('sign_width_cm', 80))
-    single_line = bool(data.get('single_line', False))
+    # single_line: True | False | None (auto-detect). Default = auto.
+    single_line_param = data.get('single_line', None)
+    single_line = bool(single_line_param) if single_line_param is not None else None
+    # Optional calibration multiplier (defaults to env var or 1.0)
+    calibration = float(data.get('calibration', os.environ.get('PRODUCTION_CALIBRATION', '1.0')))
 
     if not image_url:
         return jsonify({'error': 'Missing image_url'}), 400
 
     try:
-        result = analyze_image(image_url, sign_width_cm, single_line)
+        result = analyze_image(image_url, sign_width_cm, single_line, calibration)
         return jsonify(result)
     except requests.RequestException as e:
         return jsonify({'error': f'Failed to fetch image: {e}'}), 400
@@ -128,7 +132,32 @@ def image_to_lines(width_cm: float, gray: np.ndarray, single_line: bool) -> tupl
     return result, w
 
 
-def analyze_image(image_url: str, sign_width_cm: float, single_line: bool) -> dict:
+def detect_filled_vs_outlined(gray: np.ndarray) -> tuple:
+    """
+    Heuristic: determine if the design is filled (use single_line=True)
+    or outlined/thin lines (use single_line=False).
+
+    Returns (single_line: bool, filled_ratio: float)
+    """
+    _ret, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if cv2.countNonZero(thr) / thr.size > 0.5:
+        cv2.bitwise_not(thr, thr)
+
+    bb = cv2.boundingRect(thr)
+    _x, _y, bb_w, bb_h = bb
+    if bb_w == 0 or bb_h == 0:
+        return False, 0.0
+
+    nonzero = cv2.countNonZero(thr)
+    bb_area = bb_w * bb_h
+    filled_ratio = nonzero / max(bb_area, 1)
+
+    # Filled designs typically have > 20% pixel density in their bounding box.
+    # Thin line art / outlines / glow-effect mockups typically < 15%.
+    return filled_ratio > 0.20, filled_ratio
+
+
+def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None, calibration: float = 1.0) -> dict:
     # 1. Download
     response = requests.get(image_url, timeout=20)
     response.raise_for_status()
@@ -145,7 +174,14 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool) -> di
     else:
         gray = src
 
-    # 3. Run image_to_lines (the Yellowpop algorithm)
+    # 3. Auto-detect filled vs outlined if single_line not explicitly set
+    auto_detected = False
+    filled_ratio = None
+    if single_line is None:
+        single_line, filled_ratio = detect_filled_vs_outlined(gray)
+        auto_detected = True
+
+    # 4. Run image_to_lines (the Yellowpop algorithm)
     result, width_px = image_to_lines(sign_width_cm, gray, single_line)
 
     if result is None or width_px == 0:
@@ -153,13 +189,16 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool) -> di
             'error': 'Could not process image — no content detected',
         }
 
-    # 4. THE KEY CALCULATION (from neon.py line 348-350):
+    # 5. THE KEY CALCULATION (from neon.py line 348-350):
     #    Find contours of the thinned image, sum arc lengths divided by 2
     contours, _hierarchy = cv2.findContours(result, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
     arc_length_px = sum(cv2.arcLength(c, True) for c in contours) / 2.0
 
-    # 5. Convert to meters (matches Yellowpop's exact formula)
-    tube_length_m = round(arc_length_px * sign_width_cm / width_px / 100, 2)
+    # 6. Convert to meters (matches Yellowpop's exact formula)
+    raw_tube_length_m = round(arc_length_px * sign_width_cm / width_px / 100, 2)
+
+    # 7. Apply optional calibration multiplier
+    tube_length_m = round(raw_tube_length_m * calibration, 2)
 
     # Diagnostics
     h, w = result.shape
@@ -167,10 +206,14 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool) -> di
 
     return {
         'tube_length_m': tube_length_m,
+        'tube_length_m_raw': raw_tube_length_m,
+        'calibration_applied': calibration,
         'arc_length_px': round(arc_length_px, 1),
         'width_px': int(width_px),
         'sign_width_cm': sign_width_cm,
         'single_line': single_line,
+        'auto_detected_single_line': auto_detected,
+        'filled_ratio': round(filled_ratio, 3) if filled_ratio is not None else None,
         'thin_image_dimensions': {'width': int(w), 'height': int(h)},
         'thin_nonzero_pixels': nonzero,
         'contour_count': len(contours),
