@@ -1,12 +1,15 @@
 """
 Bernard CV — Computer Vision microservice for tube length estimation.
+v3: skeletonize + light branch pruning + production calibration multiplier.
 
-Takes a design image URL + sign width in cm, returns precise tube length
-by skeletonizing the line art and counting centerline pixels, with:
-  - Tube-thickness-aware preprocessing (erode by half tube thickness)
-  - Branch pruning (drop spurious short branches at junctions/serifs)
-
-Companion service to bernard-agent. Lives at https://bernard-cv-production.up.railway.app/
+Pipeline:
+  1. Download image, auto-detect type (line_art vs mockup)
+  2. Threshold to binary
+  3. Skeletonize to get medial axis (no erosion — was overcorrecting)
+  4. Light branch pruning via skan (drop branches < 1% of longest — removes only obvious artifacts)
+  5. Convert pixels → cm using sign_width as scale
+  6. Apply 1.1x tube multiplier (Yellowpop's formula)
+  7. Apply calibration multiplier (designer optimization factor) — tunable via env var
 """
 
 from flask import Flask, request, jsonify
@@ -14,18 +17,24 @@ import requests
 from io import BytesIO
 import numpy as np
 import cv2
-from skimage.morphology import skeletonize, binary_erosion, disk
+from skimage.morphology import skeletonize
 from skan import Skeleton, summarize
 from PIL import Image
 import os
 
 app = Flask(__name__)
 
-# Yellowpop's standard tube thickness
+# Yellowpop's standard tube thickness (informational; passed through but not used to erode)
 DEFAULT_TUBE_THICKNESS_MM = 8.0
 
-# Branches shorter than this fraction of total skeleton are pruned (likely artifacts)
-BRANCH_PRUNE_THRESHOLD = 0.03  # 3% — drops serifs / tiny junction branches
+# Branches shorter than this fraction of the longest branch are pruned (likely artifacts)
+# 1% threshold = removes tiny serif/junction noise but keeps real tube paths
+BRANCH_PRUNE_THRESHOLD = float(os.environ.get('BRANCH_PRUNE_THRESHOLD', '0.01'))
+
+# Empirical calibration multiplier — accounts for the gap between literal skeleton length
+# and actual production tube length (designers optimize routing, skip decorative micro-details).
+# Tuned against Yellowpop's calibration set. Adjust as more data comes in.
+PRODUCTION_CALIBRATION = float(os.environ.get('PRODUCTION_CALIBRATION', '0.85'))
 
 
 # ---------- Health & info endpoints ----------
@@ -35,11 +44,10 @@ def root():
     return jsonify({
         'service': 'bernard-cv',
         'status': 'ok',
-        'version': '2.0.0',
-        'features': {
-            'auto_image_type_detection': True,
-            'tube_thickness_aware': True,
-            'branch_pruning': True,
+        'version': '3.0.0',
+        'config': {
+            'branch_prune_threshold': BRANCH_PRUNE_THRESHOLD,
+            'production_calibration': PRODUCTION_CALIBRATION,
         },
         'endpoints': {
             'POST /trace-tube': 'Estimate tube length for a design image',
@@ -56,27 +64,18 @@ def health():
 
 @app.route('/trace-tube', methods=['POST'])
 def trace_tube():
-    """
-    POST /trace-tube
-    Body: {
-        "image_url": "https://...",
-        "sign_width_cm": 80,
-        "tube_thickness_mm"?: 8,
-        "image_type"?: "auto|line_art|mockup"
-    }
-    Returns JSON with tube_length_m and diagnostics.
-    """
     data = request.get_json(silent=True) or {}
     image_url = data.get('image_url')
     sign_width_cm = float(data.get('sign_width_cm', 80))
-    tube_thickness_mm = float(data.get('tube_thickness_mm', DEFAULT_TUBE_THICKNESS_MM))
     image_type = data.get('image_type', 'auto')
+    # Allow override per request (otherwise use the env-driven default)
+    calibration = float(data.get('calibration', PRODUCTION_CALIBRATION))
 
     if not image_url:
         return jsonify({'error': 'Missing image_url'}), 400
 
     try:
-        result = analyze_image(image_url, sign_width_cm, tube_thickness_mm, image_type)
+        result = analyze_image(image_url, sign_width_cm, image_type, calibration)
         return jsonify(result)
     except requests.RequestException as e:
         return jsonify({'error': f'Failed to fetch image: {e}'}), 400
@@ -87,26 +86,22 @@ def trace_tube():
 
 # ---------- Image analysis pipeline ----------
 
-def analyze_image(image_url: str, sign_width_cm: float, tube_thickness_mm: float, image_type: str = 'auto') -> dict:
+def analyze_image(image_url: str, sign_width_cm: float, image_type: str, calibration: float) -> dict:
     # 1. Download & load
     response = requests.get(image_url, timeout=20)
     response.raise_for_status()
-    raw = response.content
-    pil_img = Image.open(BytesIO(raw)).convert('RGB')
+    pil_img = Image.open(BytesIO(response.content)).convert('RGB')
     img = np.array(pil_img)
     h, w = img.shape[:2]
 
     # 2. Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # 3. Detect image type if auto
+    # 3. Detect image type (auto)
     avg_brightness = float(np.mean(gray))
     detected_type = image_type
     if image_type == 'auto':
-        if avg_brightness < 110:
-            detected_type = 'mockup'
-        else:
-            detected_type = 'line_art'
+        detected_type = 'mockup' if avg_brightness < 110 else 'line_art'
 
     # 4. Threshold to binary
     if detected_type == 'mockup':
@@ -123,7 +118,7 @@ def analyze_image(image_url: str, sign_width_cm: float, tube_thickness_mm: float
     kernel = np.ones((2, 2), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    # 6. Find content bounding box
+    # 6. Find content bounding box (used for cm/pixel scaling)
     coords = cv2.findNonZero(binary)
     if coords is None or len(coords) < 50:
         return {
@@ -134,69 +129,46 @@ def analyze_image(image_url: str, sign_width_cm: float, tube_thickness_mm: float
         }
     x, y, content_w, content_h = cv2.boundingRect(coords)
 
-    # 7. NEW: Tube-thickness-aware erosion
-    # Convert 8mm tube thickness to pixel radius using sign width as scale.
-    # Erode by HALF the tube thickness — this collapses bold/filled strokes
-    # to a thinner skeleton-friendly shape, reducing spurious branches.
-    cm_per_pixel = sign_width_cm / max(content_w, 1)
-    tube_thickness_cm = tube_thickness_mm / 10.0
-    erosion_radius_px = max(1, int(round(0.5 * tube_thickness_cm / cm_per_pixel)))
-
-    # Only erode if strokes are thick enough to benefit (avoid eroding line art away)
+    # 7. Skeletonize the binary mask directly (no erosion)
     binary_bool = binary > 0
-    binary_eroded = binary_bool
-    if erosion_radius_px > 1:
-        # Check if erosion would obliterate too much content
-        eroded_test = binary_erosion(binary_bool, disk(erosion_radius_px))
-        if np.sum(eroded_test) >= 0.3 * np.sum(binary_bool):
-            # Safe to erode — preserves at least 30% of strokes
-            binary_eroded = eroded_test
-        else:
-            # Strokes are already thin (line art) — skip erosion
-            erosion_radius_px = 0
-
-    # 8. Skeletonize
-    skeleton = skeletonize(binary_eroded)
+    skeleton = skeletonize(binary_bool)
     raw_skeleton_pixels = int(np.sum(skeleton))
 
-    # 9. NEW: Branch pruning via skan
-    # Enumerate skeleton branches; drop ones shorter than threshold
-    pruned_pixels = raw_skeleton_pixels
+    # 8. Light branch pruning via skan — drop only obvious artifacts (< 1% of longest branch)
+    pruned_pixels = float(raw_skeleton_pixels)  # default fallback
     branch_count_total = 0
     branch_count_kept = 0
-    branches_pruned_pixels = 0
+    pruned_pixels_removed = 0
 
     if raw_skeleton_pixels > 50:
         try:
             skel_obj = Skeleton(skeleton)
             df = summarize(skel_obj)
             if len(df) > 0:
-                # Total length of all branches
-                total_branch_length = df['branch-distance'].sum()
-                # Threshold: keep branches >= 3% of the LONGEST branch
-                # (anything tinier is almost certainly a serif/junction artifact)
-                max_branch = df['branch-distance'].max()
-                min_keep_length = BRANCH_PRUNE_THRESHOLD * max_branch
-                # Also keep branches > 5 pixels regardless (handle very small images)
-                min_keep_length = max(min_keep_length, 5.0)
+                max_branch = float(df['branch-distance'].max())
+                total = float(df['branch-distance'].sum())
+                # Threshold: 1% of longest branch, but at least 5 pixels (handles small images)
+                min_keep = max(BRANCH_PRUNE_THRESHOLD * max_branch, 5.0)
 
-                kept = df[df['branch-distance'] >= min_keep_length]
-                pruned = df[df['branch-distance'] < min_keep_length]
-
+                kept = df[df['branch-distance'] >= min_keep]
                 branch_count_total = int(len(df))
                 branch_count_kept = int(len(kept))
                 kept_length = float(kept['branch-distance'].sum())
-                branches_pruned_pixels = int(round(total_branch_length - kept_length))
-                pruned_pixels = int(round(kept_length))
+                pruned_pixels_removed = int(round(total - kept_length))
+                pruned_pixels = kept_length
         except Exception as e:
-            # If skan fails (rare), fall back to raw skeleton
             app.logger.warning(f'skan branch pruning failed: {e}')
 
-    # 10. Convert pixels → cm using sign_width as scale
+    # 9. Pixel → cm using sign_width as scale (use content_w, not image w, for accurate scale)
+    cm_per_pixel = sign_width_cm / max(content_w, 1)
     stroke_length_cm = pruned_pixels * cm_per_pixel
 
-    # 11. Apply tube multiplier (matches Yellowpop's getProductionPrice formula: tubeLength * 1.1)
-    tube_length_m = (stroke_length_cm / 100.0) * 1.1
+    # 10. Apply tube multiplier (1.1x — matches Yellowpop's getProductionPrice formula)
+    tube_length_m_raw = (stroke_length_cm / 100.0) * 1.1
+
+    # 11. Apply production calibration multiplier
+    # (literal skeleton ≠ actual production tube, designers optimize)
+    tube_length_m = tube_length_m_raw * calibration
 
     # 12. Confidence
     content_ratio = (content_w * content_h) / (w * h)
@@ -209,10 +181,11 @@ def analyze_image(image_url: str, sign_width_cm: float, tube_thickness_mm: float
 
     return {
         'tube_length_m': round(tube_length_m, 2),
+        'tube_length_m_raw_skeleton': round(tube_length_m_raw, 2),
         'stroke_length_cm': round(stroke_length_cm, 2),
-        'skeleton_pixels': pruned_pixels,
+        'skeleton_pixels': int(round(pruned_pixels)),
         'raw_skeleton_pixels_before_pruning': raw_skeleton_pixels,
-        'pruned_pixels_removed': branches_pruned_pixels,
+        'pruned_pixels_removed': pruned_pixels_removed,
         'branch_count_total': branch_count_total,
         'branch_count_kept': branch_count_kept,
         'image_dimensions': {'width': w, 'height': h},
@@ -223,8 +196,7 @@ def analyze_image(image_url: str, sign_width_cm: float, tube_thickness_mm: float
         'cm_per_pixel': round(cm_per_pixel, 4),
         'confidence': confidence,
         'multiplier_applied': 1.1,
-        'tube_thickness_mm': tube_thickness_mm,
-        'erosion_radius_px': erosion_radius_px,
+        'production_calibration': calibration,
     }
 
 
