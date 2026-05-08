@@ -230,20 +230,25 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None
     h, w = result.shape
     nonzero = int(cv2.countNonZero(result))
 
-    # NEW: Confidence flag
-    # If a high fraction of contours had to be dropped as artifacts, signal low confidence
+    # NEW: Reliability tier — multi-signal classification
     contours_dropped_ratio = contours_dropped / max(all_contours_count, 1)
-    if all_contours_count > 500 or contours_dropped_ratio > 0.5:
-        confidence = 'low'
-    elif all_contours_count > 200 or contours_dropped_ratio > 0.25:
-        confidence = 'medium'
-    else:
-        confidence = 'high'
+    tube_density_m_per_m = tube_length_m / max(sign_width_cm / 100.0, 0.01)  # m of tube per m of sign width
+
+    accuracy_tier, tier_reasons = classify_accuracy_tier(
+        contour_count_total=all_contours_count,
+        contours_dropped_ratio=contours_dropped_ratio,
+        tube_density=tube_density_m_per_m,
+        sign_width_cm=sign_width_cm,
+    )
+
+    # Legacy 'confidence' field retained for backwards compatibility
+    confidence = {'high': 'high', 'medium': 'medium', 'low': 'low', 'unreliable': 'low'}[accuracy_tier]
 
     return {
         'tube_length_m': tube_length_m,
         'tube_length_m_raw': raw_tube_length_m,
         'tube_length_m_unfiltered': round(arc_length_px_unfiltered * sign_width_cm / width_px / 100, 2),
+        'tube_density_m_per_m': round(tube_density_m_per_m, 2),
         'calibration_applied': calibration,
         'arc_length_px': round(arc_length_px, 1),
         'width_px': int(width_px),
@@ -257,9 +262,63 @@ def analyze_image(image_url: str, sign_width_cm: float, single_line: bool | None
         'contour_count_significant': len(significant_contours),
         'contours_dropped_as_artifacts': contours_dropped,
         'min_contour_length_px': round(min_contour_length_px, 1),
-        'confidence': confidence,
+        'accuracy_tier': accuracy_tier,             # 'high' | 'medium' | 'low' | 'unreliable'
+        'tier_reasons': tier_reasons,               # list[str] explaining tier choice
+        'confidence': confidence,                    # legacy
         'algorithm': 'yellowpop_production_zhang_suen_arclength',
     }
+
+
+def classify_accuracy_tier(contour_count_total: int, contours_dropped_ratio: float,
+                           tube_density: float, sign_width_cm: float) -> tuple:
+    """
+    Multi-signal accuracy tier classification.
+    Returns (tier_name, list_of_reasons).
+
+    Tiers (worst-of-all-signals wins):
+      - 'unreliable': don't show automated price; route to manual quote
+      - 'low':        wide price range with caveats
+      - 'medium':     moderate range, verify before final quote
+      - 'high':       tight price range, auto-quote OK
+    """
+    reasons = []
+
+    # Unreliable triggers
+    if contour_count_total > 500:
+        reasons.append(f'Excessive fragmentation ({contour_count_total} contours; likely noisy or photographic input)')
+    if contours_dropped_ratio > 0.5:
+        reasons.append(f'>{int(contours_dropped_ratio*100)}% of contours filtered as artifacts')
+    if tube_density > 20:
+        reasons.append(f'Tube density {tube_density:.1f} m/m too high — design may not be production-feasible as drawn')
+    if sign_width_cm >= 30 and tube_density < 2:
+        reasons.append(f'Tube density {tube_density:.2f} m/m unusually low — sparse design')
+
+    if reasons:
+        return 'unreliable', reasons
+
+    # Low triggers
+    if contour_count_total > 200:
+        reasons.append(f'High contour count ({contour_count_total})')
+    if contours_dropped_ratio > 0.3:
+        reasons.append(f'{int(contours_dropped_ratio*100)}% of contours filtered as artifacts')
+    if tube_density > 15:
+        reasons.append(f'Dense design (tube density {tube_density:.1f} m/m)')
+
+    if reasons:
+        return 'low', reasons
+
+    # Medium triggers
+    if contour_count_total > 50:
+        reasons.append(f'Moderate complexity ({contour_count_total} contours)')
+    if contours_dropped_ratio > 0.1:
+        reasons.append(f'{int(contours_dropped_ratio*100)}% artifacts removed')
+    if tube_density > 12 or tube_density < 5:
+        reasons.append(f'Tube density {tube_density:.1f} m/m at edge of typical range')
+
+    if reasons:
+        return 'medium', reasons
+
+    return 'high', ['Clean signal — low contour count, minimal artifacts, normal density']
 
 
 if __name__ == '__main__':
